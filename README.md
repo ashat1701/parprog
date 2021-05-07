@@ -6,5 +6,9 @@
 ```
 Also threre are two defines - BENCH and TEST. BENCH - compute speed for different number of threads. TEST - check if parallel multiplication is correct.
 
+## Graph of speed
+![kek](graph.png)
+
 ## Next steps
 We can work now on kernel - multi of one block. SSE/AVX, cycles unwrap and so on.
+
