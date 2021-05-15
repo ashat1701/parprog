@@ -1,155 +1,206 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <immintrin.h>
+#include <random>
+#include <chrono>
+#include <fstream>
+#include <functional>
 
-//#define TEST
-#define BENCH
-
-#define PARTITION_FACTOR 4
-#define array(matrix, i, j) matrix.arr[(int) matrix.m * (int) i + (int) j]
-
-const auto N = 1024, M = 1024, K = 1024;
-// Struct for matrix
-struct Matrix {
-  int *arr;
-  int n, m;
-  Matrix(int n, int m) : n(n), m(m), arr(new int[n * m]) {}
-  // Fill with test data
-  void fill() const {
-    for (int i = 0; i < n; i++) {
-      for (int j = 0; j < m; j++) {
-        arr[m * i + j] = i + j;
-      }
-    }
-  }
-  ~Matrix() {
-    delete [] arr;
-  }
+using namespace std::chrono_literals;
+const int MAGIC = 13; // maybe it should be power of 2 :-| (check would be easier)
+const int MAX_THREADS = 10;
+const int ITER_CNT = 200;
+// Simple spinlock interface
+class Spinlock {
+ public:
+  virtual void lock() = 0;
+  virtual void unlock() = 0;
+  virtual bool try_lock() = 0;
 };
 
-struct ThreadInfo {
-  int id;
-  int thread_count;
-  const Matrix &a, &b;
-  Matrix &result;
-  ThreadInfo(int id, int thread_count, const Matrix& a, const Matrix& b, Matrix& result) :
-    id(id), thread_count(thread_count), a(a), b(b), result(result) {}
+//TAS with yield, pause, and backoff
+class TASpinlock : public Spinlock {
+ public:
+  TASpinlock() : lock_(0) {}
+
+  void lock() override {
+    auto wait_dur = 1us;
+    for (int spin_count = 0; lock_.exchange(1, std::memory_order_acquire); spin_count++) {
+      if (spin_count == MAGIC) {
+        std::this_thread::yield();
+      } else {
+        if (spin_count == MAGIC * 2) {
+          wait_dur *= 2;
+          std::this_thread::sleep_for(wait_dur);
+          spin_count = 0;
+        } else {
+          _mm_pause();
+        }
+      }
+    }
+  }
+
+  bool try_lock() override {
+    return !lock_.exchange(1, std::memory_order_acquire);
+  }
+
+  void unlock() override  {
+    lock_.store(0, std::memory_order_release);
+  }
+ private:
+  std::atomic<unsigned int> lock_;
 };
 
-/* There are optimization for last cycle with avx/sse instructions:
- *
-    int new_m = m >> 3;
-    __m256 ymm0, ymm1, ymm2, ymm3;
-    ymm0 = _mm256_set1_ps(0);
-    for (int i = 0; i < new_m; i++) {
-        ymm1 = _mm256_loadu_ps(a + (i << 3));
-        ymm2 = _mm256_loadu_ps(b + (i << 3));
-        ymm3 = _mm256_dp_ps(ymm1, ymm2, 0b11110001);
-        ymm0 = _mm256_add_ps(ymm0, ymm3);
-    }
-    __m128 xmm1 = _mm256_extractf128_ps(ymm0, 1);
-    __m128 xmm0 = _mm256_extractf128_ps(ymm0, 0);
-    xmm0 = _mm_add_ps(xmm0, xmm1);
-    float ans = _mm_cvtss_f32(xmm0);
-    int rem = m & 7;
-    int offset = new_m << 3;
+//TTAS with yield, pause and backoff
+class TTASpinlock: public Spinlock {
+ public:
+  TTASpinlock() : lock_(0) {}
 
-    for (int j = 0; j < rem; j++)
-        ans += a[j + offset] * b[j + offset];
-  We can speed up even faster when use such type of 'kernel'
-*/
-inline void multiplyBlock(const Matrix& a, const Matrix& b, Matrix& result,
-                          int i_start, int i_fin,
-                          int j_start, int j_fin,
-                          int k_start, int k_fin) {
-  for (int i = i_start; i < i_fin; i++) {
-    for (int j = j_start; j < j_fin; j++) {
-      for (int k = k_start; k < k_fin; k++) {
-        array(result, i, j) += array(a, i, k) * array(b, k, j);
+  void lock() override {
+    auto wait_dur = 1us;
+    for (; lock_.exchange(1, std::memory_order_acquire);) {
+      for (int spin_count = 0; lock_.load(std::memory_order_relaxed); spin_count++) {
+        if (spin_count == MAGIC) {
+          std::this_thread::yield();
+        } else {
+          if (spin_count == 2 * MAGIC) {
+            wait_dur *= 2;
+            std::this_thread::sleep_for(wait_dur);
+          }
+          _mm_pause();
+        }
       }
     }
   }
-}
 
-void ThreadWork(ThreadInfo info) {
-  int tile_width = info.result.m / PARTITION_FACTOR;
-  for (int ii = 0; ii < PARTITION_FACTOR; ii++) {
-    for (int jj = 0; jj < PARTITION_FACTOR; jj++) {
-      int left_edge = info.id * (tile_width / info.thread_count) + jj * tile_width;
-      int right_edge = (info.id + 1) * (tile_width / info.thread_count) + jj * tile_width;
-      for (int kk = 0; kk < PARTITION_FACTOR; kk++) {
-        multiplyBlock(info.a, info.b, info.result, ii * tile_width,
-                      (ii + 1) * tile_width, left_edge, right_edge, kk * tile_width, (kk + 1) * tile_width);
-      }
+  bool try_lock() override {
+    return !lock_.load(std::memory_order_relaxed) &&
+        !lock_.exchange(1, std::memory_order_acquire);
+  }
+
+  void unlock() override {
+    lock_.store(0, std::memory_order_release);
+  }
+ private:
+  std::atomic<unsigned int> lock_;
+};
+
+class TicketSpinlock : public Spinlock{
+ public:
+  TicketSpinlock() : in_(0), out_(0) {}
+  void lock() override {
+    auto wait_dur = 1us;
+    auto cur_ticket = in_.fetch_add(1, std::memory_order_relaxed);
+    for (int spin_count = 0; out_.load(std::memory_order_acquire) != cur_ticket; spin_count++) {
+      if (spin_count == MAGIC) {
+        std::this_thread::yield();
+      } else
+        if (spin_count == MAGIC * 2) {
+          wait_dur *= 2;
+          std::this_thread::sleep_for(wait_dur);
+          spin_count = 0;
+        } else {
+          _mm_pause();
+        }
     }
   }
-}
 
-void stupidMultiplication(const Matrix& a, const Matrix& b, Matrix& result) {
-  for (int i = 0; i < a.n; i++) {
-    for (int j = 0; j < b.m; j++) {
-      for (int k = 0; k < a.m; k++) {
-        array(result, i, j) += array(a, i, k) * array(b, k, j);
-      }
-    }
+  void unlock() override {
+    // If we use here fetch_add it would be slower ((
+    out_.store(out_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
   }
-}
-
-void fastMultiplication(const Matrix& a, const Matrix& b, Matrix& result, int thread_count) {
-  std::vector<std::thread> working_threads;
-  working_threads.reserve(thread_count);
-  for (int i = 0; i < thread_count; i++) {
-     working_threads.emplace_back([thread_count, &a, &b, &result, i]() {
-      ThreadWork(ThreadInfo(i, thread_count, a, b, result));
-    });
-  }
-  for (int i = 0; i < thread_count; i++) {
-    working_threads[i].join();
-  }
-}
-
-bool checkCorrect(const Matrix& a, const Matrix& b, int thread_count) {
-  Matrix result_stupid(a.n, b.m);
-  Matrix result_fast(a.n, b.m);
-  stupidMultiplication(a, b, result_stupid);
-  fastMultiplication(a, b, result_fast, thread_count);
-  for (int i = 0; i < result_fast.n; i++) {
-    for (int j = 0; j < result_fast.m; j++) {
-      if (array(result_fast, i, j) != array(result_stupid, i, j)) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-int main(int argc, char ** argv) {
-  if (argc < 2) {
-    std::cerr << "Usage: mult threadCount" << std::endl;
-    return 1;
-  }
-  auto thread_count = std::atoi(argv[1]);
-
-  Matrix a(N, M);
-  Matrix b(M, K);
-  a.fill();
-  b.fill();
-  #ifdef TEST
-  if (!checkCorrect(a, b, thread_count)) {
-    std::cerr << "Fast multiplication incorrect" << std::endl;
+  // I dont know how to implement try_lock there (maybe we should fetch_add(-1) after unsuccessful try)
+  bool try_lock() override {
     std::abort();
   }
-  std::cout << "Fast multiplication correct" << std::endl;
-  #endif
-#ifdef BENCH
-  for (int count = 1; count < 10; count++) {
-    Matrix result(N, K);
-    auto before = std::chrono::steady_clock::now();
-    fastMultiplication(a, b, result, count);
-    auto after = std::chrono::steady_clock::now();
-    std::chrono::duration<double> elapsed_seconds = after - before;
-    std::cout << count << " " << (elapsed_seconds).count() << std::endl;
+ private:
+  std::atomic<unsigned int> in_, out_;
+};
+
+// Simple benchmark where threads are contenting on one mutex
+// We measure longest_wait to check if there starvation
+auto bench1(Spinlock& spin) {
+  auto longest_wait = 0ns;
+  for (int i = 0; i < ITER_CNT; i++) {
+    auto time_before = std::chrono::high_resolution_clock::now();
+    spin.lock();
+    auto wait_time = std::chrono::high_resolution_clock::now() - time_before;
+    longest_wait = std::max(wait_time, longest_wait);
+    spin.unlock();
   }
-#endif
-  return 0;
+  return longest_wait;
+}
+
+int Rand() {
+  static std::random_device rd;
+  static std::mt19937 mt(rd());
+  static std::uniform_int_distribution<int> dist(1, 100);
+  return dist(mt);
+}
+
+// Lets try to aquire mutex in different time
+auto bench2(Spinlock& spin) {
+  auto longest_wait = 0ns;
+  for (int i = 0; i < ITER_CNT; i++) {
+    std::this_thread::sleep_for(1ms * (Rand()));
+    auto time_before = std::chrono::high_resolution_clock::now();
+    spin.lock();
+    auto wait_time = std::chrono::high_resolution_clock::now() - time_before;
+    longest_wait = std::max(wait_time, longest_wait);
+    spin.unlock();
+  }
+  return longest_wait;
+}
+
+// Let's do or one very hard job, or one light randomly
+auto bench3(Spinlock& spin) {
+  for (int i = 0; i < ITER_CNT; i++) {
+    spin.lock();
+    if (Rand() % 2) {
+      std::this_thread::sleep_for(100ms);
+    }
+    spin.unlock();
+  }
+  return 1ns;
+}
+
+void do_bench(const std::function<decltype(1ns)(Spinlock&)>& bench, Spinlock& spin, std::ofstream& file) {
+  for (int threads = 1; threads < MAX_THREADS; threads++) {
+    std::vector<std::thread> thr;
+    std::vector<decltype(1ns)> b1(threads);
+    auto time_before = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < threads; i++) {
+      thr.emplace_back([&spin, &b1, i, &bench](){
+        b1[i] = bench(spin);
+      });
+    }
+    for (int i = 0; i < threads; i++) {
+      thr[i].join();
+    }
+    auto time_after = std::chrono::high_resolution_clock::now();
+    file << (time_after - time_before).count() << " ";
+    for (auto&& it : b1) {
+      file << it.count() << " ";
+    }
+    file << std::endl;
+  }
+}
+
+void doBenchSeries(Spinlock& spin, const std::string& filename) {
+  std::ofstream out(filename);
+  do_bench(bench1, spin, out);
+  std::cerr << "bench1 completed" << std::endl;
+  do_bench(bench2, spin, out);
+  do_bench(bench3, spin, out);
+  out.close();
+}
+
+int main() {
+  TASpinlock tas;
+  TTASpinlock ttas;
+  TicketSpinlock ticket;
+  //doBenchSeries(tas, "tas.txt");
+  //doBenchSeries(ttas, "ttas.txt");
+  doBenchSeries(ticket, "ticket.txt");
 }
